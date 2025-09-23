@@ -64,6 +64,10 @@ class Trainer:
         log_output: bool=False,
         use_distributed: bool=False,
         verbose: bool=False,
+        early_stopping: bool=False,
+        early_stopping_patience: int=10,
+        early_stopping_metric: str='test_l2',
+        early_stopping_min_delta: float=0.001,
     ):
         """
         """
@@ -77,6 +81,12 @@ class Trainer:
         self.eval_interval = eval_interval
         self.log_output = log_output
         self.verbose = verbose
+        
+        # Early stopping parameters
+        self.early_stopping = early_stopping
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_metric = early_stopping_metric
+        self.early_stopping_min_delta = early_stopping_min_delta
         self.use_distributed = use_distributed
         self.device = device
         # handle autocast device
@@ -109,6 +119,8 @@ class Trainer:
         resume_from_dir: Union[str, Path]=None,
         max_autoregressive_steps: int=None,
     ):
+        # Store test_loaders for image logging
+        self.test_loaders = test_loaders
         """Trains the given model on the given dataset.
 
         If a device is provided, the model and data processor are loaded to device here. 
@@ -179,7 +191,14 @@ class Trainer:
                               "expects losses to sum across the batch dim.")
 
         if eval_losses is None:  # By default just evaluate on the training loss
-            eval_losses = dict(l2=training_loss)
+            # eval_losses = dict(l2=training_loss)
+
+            loss_name = training_loss.__class__.__name__.lower()
+            # print(loss_name)
+            eval_losses = {loss_name: training_loss}
+            # eval_losses = dict(loss_name=training_loss)
+
+            # print(eval_losses)
         
         # accumulated wandb metrics
         self.wandb_epoch_metrics = None
@@ -216,20 +235,35 @@ class Trainer:
             # either monitor metric or save on interval, exclusive for simplicity
             self.save_every = None
 
+        print(f"DEBUG: verbose set to {self.verbose}")
+
         if self.verbose:
             print(f'Training on {len(train_loader.dataset)} samples')
             print(f'Testing on {[len(loader.dataset) for loader in test_loaders.values()]} samples'
                   f'         on resolutions {[name for name in test_loaders]}.')
+            if self.early_stopping:
+                print(f'Early stopping enabled: patience={self.early_stopping_patience}, metric={self.early_stopping_metric}, min_delta={self.early_stopping_min_delta}')
             sys.stdout.flush()
+        
+        # Initialize early stopping variables
+        best_metric_value = float('inf')
+        early_stopping_counter = 0
+        early_stop_epoch = None
         
         for epoch in range(self.start_epoch, self.n_epochs):
             train_err, avg_loss, avg_lasso_loss, epoch_train_time =\
                   self.train_one_epoch(epoch, train_loader, training_loss)
+            # Get learning rate
+            lr = None
+            for pg in self.optimizer.param_groups:
+                lr = pg["lr"]
+            
             epoch_metrics = dict(
                 train_err=train_err,
                 avg_loss=avg_loss,
                 avg_lasso_loss=avg_lasso_loss,
-                epoch_train_time=epoch_train_time
+                epoch_train_time=epoch_train_time,
+                lr=lr
             )
             
             if epoch % self.eval_interval == 0:
@@ -240,16 +274,78 @@ class Trainer:
                                                 eval_modes=eval_modes,
                                                 max_autoregressive_steps=max_autoregressive_steps)
                 epoch_metrics.update(**eval_metrics)
+
+                # Step ReduceLROnPlateau scheduler with validation loss
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    # Use the primary validation metric for scheduler
+                    # Try to find the metric that matches the early stopping metric first
+                    val_metric = None
+                    metric_name = None
+                    
+                    if self.early_stopping and self.early_stopping_metric in eval_metrics:
+                        # Use the same metric as early stopping for consistency
+                        val_metric = eval_metrics[self.early_stopping_metric]
+                        metric_name = self.early_stopping_metric
+                    else:
+                        raise ValueError(f"ReduceLROnPlateau scheduler requires evaluation metrics, but none were found. "
+                                       f"Early stopping metric: {self.early_stopping_metric}, "
+                                       f"Available metrics: {list(eval_metrics.keys()) if eval_metrics else 'None'}")
+                    
+                    if val_metric is not None:
+                        # Convert tensor to float for scheduler
+                        if hasattr(val_metric, 'item'):
+                            val_metric = val_metric.item()
+                        self.scheduler.step(val_metric)
+                        if self.verbose:
+                            current_lr = self.optimizer.param_groups[0]['lr']
+                            print(f"📉 Scheduler step with {metric_name}: {val_metric:.6f}, LR: {current_lr:.2e}")
+
+                # Early stopping logic
+                if self.early_stopping and self.early_stopping_metric in eval_metrics:
+                    current_metric_value = eval_metrics[self.early_stopping_metric]
+                    
+                    #if current_metric_value < (best_metric_value - self.early_stopping_min_delta):
+
+                    if current_metric_value < (best_metric_value):
+                        best_metric_value = current_metric_value
+                        early_stopping_counter = 0
+                    else:
+                        early_stopping_counter += 1
+                        if self.verbose:
+                            print(f"⏳ Early stopping counter: {early_stopping_counter}/{self.early_stopping_patience}")
+                    
+                    # Check if early stopping should trigger
+                    if early_stopping_counter >= self.early_stopping_patience:
+                        early_stop_epoch = epoch + 1
+                        if self.verbose:
+                            print(f"🛑 Early stopping triggered at epoch {early_stop_epoch}!")
+                            print(f"   Best {self.early_stopping_metric}: {best_metric_value:.6f}")
+                        break
+                
                 # save checkpoint if conditions are met
                 if save_best is not None:
                     if eval_metrics[save_best] < best_metric_value:
                         best_metric_value = eval_metrics[save_best]
                         self.checkpoint(save_dir)
+                
+                # Log all metrics for eval epochs
+                self.log_epoch_metrics(epoch, epoch_metrics, eval_metrics)
+            else:
+                # Log training metrics only for non-eval epochs
+                self.log_epoch_metrics(epoch, epoch_metrics, None)
 
             # save checkpoint if save_every and save_best is not set
             if self.save_every is not None:
                 if epoch % self.save_every == 0:
                     self.checkpoint(save_dir)
+
+        # Final training summary
+        if self.verbose:
+            if early_stop_epoch is not None:
+                print(f"\n🎯 Training completed with early stopping at epoch {early_stop_epoch}")
+                print(f"   Best {self.early_stopping_metric}: {best_metric_value:.6f}")
+            else:
+                print(f"\n✅ Training completed normally after {self.n_epochs} epochs")
 
         return epoch_metrics
 
@@ -271,6 +367,11 @@ class Trainer:
         all_errors
             dict of all eval metrics for the last epoch
         """
+
+        # edited 
+        if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
+    
         self.on_epoch_start(epoch)
         avg_loss = 0
         avg_lasso_loss = 0
@@ -294,10 +395,15 @@ class Trainer:
                 avg_loss += loss.item()
                 if self.regularizer:
                     avg_lasso_loss += self.regularizer.loss
+            
+            # Print batch progress every 50 batches
+            if self.verbose and idx % 5 == 0:
+                print(f"  Batch {idx+1:4d}/{len(train_loader)} | Loss: {loss.item():.6f}")
+            
 
-        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            self.scheduler.step(train_err)
-        else:
+        # Only step non-ReduceLROnPlateau schedulers here
+        # ReduceLROnPlateau schedulers are stepped after validation with validation loss
+        if not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             self.scheduler.step()
 
         epoch_train_time = default_timer() - t1
@@ -427,11 +533,7 @@ class Trainer:
         
         for key in errors.keys():
             errors[key] /= self.n_samples
-
-        # on last batch, log model outputs
-        if self.log_output and self.wandb_log:
-            errors[f"{log_prefix}_outputs"] = wandb.Image(outs)
-        
+            
         return errors
     
     def on_epoch_start(self, epoch):
@@ -449,6 +551,8 @@ class Trainer:
         None
         """
         self.epoch = epoch
+        
+        
         return None
 
     def train_one_batch(self, idx, sample, training_loss):
@@ -689,10 +793,7 @@ class Trainer:
         print(msg)
         sys.stdout.flush()
         
-        if self.wandb_log:
-            wandb.log(data=values_to_log,
-                      step=epoch+1,
-                      commit=False)
+        # Note: wandb logging is now handled at the end of each epoch to avoid step conflicts
     
     def log_eval(self,
                  epoch: int,
@@ -721,10 +822,88 @@ class Trainer:
         print(msg)
         sys.stdout.flush()
 
-        if self.wandb_log:
-            wandb.log(data=values_to_log,
-                      step=epoch+1,
-                      commit=True)
+        # Note: wandb logging is now handled at the end of each epoch to avoid step conflicts
+
+    def log_epoch_metrics(self, epoch, train_metrics=None, eval_metrics=None):
+        """Consolidated logging function that handles all wandb logging at the end of each epoch.
+        This prevents step conflicts by ensuring all logs happen in the correct order.
+        
+        Parameters
+        ----------
+        epoch : int
+            current epoch number
+        train_metrics : dict, optional
+            training metrics to log
+        eval_metrics : dict, optional
+            evaluation metrics to log
+        """
+        if not self.wandb_log:
+            return
+            
+        try:
+            import torch.distributed as dist
+            # Only log from rank 0 to avoid step conflicts
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return
+        except:
+            pass  # Not in distributed mode
+            
+        # Collect all metrics to log
+        all_metrics = {}
+        
+        # Add training metrics
+        if train_metrics:
+            all_metrics.update(train_metrics)
+            
+        # Add evaluation metrics
+        if eval_metrics:
+            all_metrics.update(eval_metrics)
+            
+        # Add gradient monitoring (only if we have gradients and not first epoch)
+        if train_metrics and epoch > 0:
+            try:
+                from utils.diagnostics import grad_norm, grad_max
+                grad_norm_val = grad_norm(self.model)
+                grad_max_val = grad_max(self.model)
+                all_metrics.update({
+                    'grad_norm': grad_norm_val,
+                    'grad_max': grad_max_val
+                })
+            except Exception as e:
+                print(f"Warning: Could not log gradients: {e}")
+        
+        # Add image logging every N epochs (regardless of eval_metrics)
+        if hasattr(self, 'test_loaders') and 'test' in self.test_loaders:
+            try:
+                wandb_table_logging_interval = getattr(wandb.config, 'wandb_table_logging_interval', 25)
+                if epoch % wandb_table_logging_interval == 0:
+                    from utils.diagnostics import log_input_target_prediction
+                    
+                    print(f"Logging validation images to wandb for epoch {epoch}")
+                    
+                    # Get a sample batch from validation
+                    model = self.model
+                    model.eval()
+                    with torch.no_grad():
+                        sample_batch = next(iter(self.test_loaders['test']))
+                        inputs = sample_batch['x'].to(self.device)
+                        targets = sample_batch['y'].to(self.device)
+                        
+                        # Get predictions
+                        predictions = model(inputs)
+                        
+                        # Log images to wandb table with explicit step
+                        _wandb_table = wandb.Table(columns=['Id', 'Input', 'Target', 'Prediction', 'Target-Prediction'])
+                        _wandb_table = log_input_target_prediction(inputs, targets, predictions, _wandb_table, epoch)
+                        all_metrics[f"EPOCH {epoch} Validation Input/Target/Prediction"] = _wandb_table
+                    
+                    model.train()
+            except Exception as e:
+                print(f"Warning: Could not log validation images: {e}")
+        
+        # Log everything at once with commit=True at the end of epoch
+        if all_metrics:
+            wandb.log(data=all_metrics, step=epoch+1, commit=True)
 
     def resume_state_from_dir(self, save_dir):
         """
