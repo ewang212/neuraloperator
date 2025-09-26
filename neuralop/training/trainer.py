@@ -68,6 +68,7 @@ class Trainer:
         early_stopping_patience: int=10,
         early_stopping_metric: str='test_l2',
         early_stopping_min_delta: float=0.001,
+        scheduler_warmup_epochs: int=0,
     ):
         """
         """
@@ -87,6 +88,9 @@ class Trainer:
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_metric = early_stopping_metric
         self.early_stopping_min_delta = early_stopping_min_delta
+        
+        # Scheduler warmup parameter
+        self.scheduler_warmup_epochs = scheduler_warmup_epochs
         self.use_distributed = use_distributed
         self.device = device
         # handle autocast device
@@ -282,12 +286,12 @@ class Trainer:
                     val_metric = None
                     metric_name = None
                     
-                    if self.early_stopping and self.early_stopping_metric in eval_metrics:
+                    if self.early_stopping_metric in eval_metrics:
                         # Use the same metric as early stopping for consistency
                         val_metric = eval_metrics[self.early_stopping_metric]
                         metric_name = self.early_stopping_metric
                     else:
-                        raise ValueError(f"ReduceLROnPlateau scheduler requires evaluation metrics, but none were found. "
+                        raise ValueError(f"ERICA ReduceLROnPlateau scheduler requires evaluation metrics, but none were found. "
                                        f"Early stopping metric: {self.early_stopping_metric}, "
                                        f"Available metrics: {list(eval_metrics.keys()) if eval_metrics else 'None'}")
                     
@@ -295,10 +299,16 @@ class Trainer:
                         # Convert tensor to float for scheduler
                         if hasattr(val_metric, 'item'):
                             val_metric = val_metric.item()
-                        self.scheduler.step(val_metric)
-                        if self.verbose:
-                            current_lr = self.optimizer.param_groups[0]['lr']
-                            print(f"📉 Scheduler step with {metric_name}: {val_metric:.6f}, LR: {current_lr:.2e}")
+                        
+                        # Only step scheduler after warmup period (if warmup is enabled)
+                        warmup_epochs = getattr(self, 'scheduler_warmup_epochs', 0)
+                        if epoch >= warmup_epochs:
+                            self.scheduler.step(val_metric)
+                            if self.verbose:
+                                current_lr = self.optimizer.param_groups[0]['lr']
+                                print(f"📉 Scheduler step with {metric_name}: {val_metric:.6f}, LR: {current_lr:.2e}")
+                        elif self.verbose and warmup_epochs > 0:
+                            print(f"⏸️  Scheduler warmup: epoch {epoch+1}/{warmup_epochs} (scheduler disabled)")
 
                 # Early stopping logic
                 if self.early_stopping and self.early_stopping_metric in eval_metrics:
